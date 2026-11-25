@@ -351,12 +351,13 @@ object DownloadManager {
                     }
                 }
             } catch (e: Exception) {
+                val formattedErr = formatDiagnosticError(e.message ?: "Download error")
                 updateItem(id) {
                     it.copy(
                         status = DownloadStatus.FAILED,
                         speedBytesPerSec = 0L,
                         statusDetail = "",
-                        errorMessage = (e.message ?: "Download error").take(350)
+                        errorMessage = formattedErr
                     )
                 }
             } finally {
@@ -366,6 +367,18 @@ object DownloadManager {
             }
         }
         activeJobs[id] = job
+    }
+
+    private fun formatDiagnosticError(raw: String): String {
+        val lines = raw.lines().map { it.trim() }.filter { it.isNotBlank() }
+        if (lines.isEmpty()) return "Download error"
+        val errorLine = lines.lastOrNull { it.startsWith("ERROR:", ignoreCase = true) }
+        return if (errorLine != null && lines.size > 1) {
+            val rest = lines.filterNot { it == errorLine }.joinToString("\n")
+            "$errorLine\n\n$rest".take(1200)
+        } else {
+            lines.joinToString("\n").take(1200)
+        }
     }
 
     fun pauseDownload(id: String) {

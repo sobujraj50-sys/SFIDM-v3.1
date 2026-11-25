@@ -58,7 +58,6 @@ import com.sfidm.downloader.ui.strings.stringsFor
 import com.sfidm.downloader.ui.theme.AppTheme
 import com.sfidm.downloader.ui.theme.SfidmTheme
 import com.sfidm.downloader.ui.vault.PrivateVaultScreen
-import com.yausername.youtubedl_android.YoutubeDL
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -291,9 +290,10 @@ fun SfidmAppShell(
                             scope.launch {
                                 val res = DownloadManager.updateVideoEngine()
                                 isUpdatingEngine = false
-                                val msg = when (res.status) {
-                                    YoutubeDL.UpdateStatus.DONE -> "${strings.engineUpdated} (${res.channelUsed})"
-                                    YoutubeDL.UpdateStatus.ALREADY_UP_TO_DATE -> "${strings.engineUpToDate} (${res.channelUsed})"
+                                val verTag = if (res.versionInfo.isNotBlank()) " (${res.versionInfo})" else ""
+                                val msg = when {
+                                    res.success && res.alreadyUpToDate -> "${strings.engineUpToDate}$verTag"
+                                    res.success -> "${strings.engineUpdated}$verTag"
                                     else -> "${strings.engineUpdateFailed}: ${res.errorMessage ?: ""}"
                                 }
                                 Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
@@ -740,7 +740,7 @@ fun DownloadCard(
                             val folderTag = if (item.isVault) "Vault" else "SFIDM/${item.category.folderName}"
                             "${strings.statusCompleted} • $folderTag"
                         }
-                        DownloadStatus.FAILED -> "${strings.statusFailed}: ${item.errorMessage}"
+                        DownloadStatus.FAILED -> "${strings.statusFailed}: ${item.errorMessage.substringBefore("\n")}"
                     }
                     Text(
                         text = statusLabel,

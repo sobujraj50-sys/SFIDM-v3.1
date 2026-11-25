@@ -14,6 +14,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
 class MediaVideoDownloader(
@@ -25,8 +26,8 @@ class MediaVideoDownloader(
     private var engineReady = false
 
     private val webClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(40, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
@@ -39,8 +40,9 @@ class MediaVideoDownloader(
     )
 
     data class EngineUpdateResult(
-        val status: YoutubeDL.UpdateStatus?,
-        val channelUsed: String,
+        val success: Boolean,
+        val alreadyUpToDate: Boolean = false,
+        val versionInfo: String = "",
         val errorMessage: String? = null
     )
 
@@ -61,41 +63,101 @@ class MediaVideoDownloader(
 
     suspend fun updateEngine(): EngineUpdateResult = withContext(Dispatchers.IO) {
         ensureInitialized()
-        // Try Nightly channel first (most up-to-date for YouTube/FB/TikTok/Pinterest), then Stable
-        val nightlyAttempt = runCatching {
+
+        // 1. Try built-in updater first
+        val builtIn = runCatching {
             YoutubeDL.getInstance().updateYoutubeDL(
                 context.applicationContext,
                 YoutubeDL.UpdateChannel.NIGHTLY
             )
-        }
-        if (nightlyAttempt.isSuccess) {
+        }.getOrNull()
+
+        if (builtIn == YoutubeDL.UpdateStatus.DONE || builtIn == YoutubeDL.UpdateStatus.ALREADY_UP_TO_DATE) {
+            val ver = runCatching { YoutubeDL.getInstance().version(context.applicationContext) }.getOrNull().orEmpty()
             return@withContext EngineUpdateResult(
-                status = nightlyAttempt.getOrNull(),
-                channelUsed = "Nightly"
+                success = true,
+                alreadyUpToDate = (builtIn == YoutubeDL.UpdateStatus.ALREADY_UP_TO_DATE),
+                versionInfo = ver
             )
         }
 
-        val stableAttempt = runCatching {
-            YoutubeDL.getInstance().updateYoutubeDL(
-                context.applicationContext,
-                YoutubeDL.UpdateChannel.STABLE
-            )
-        }
-        if (stableAttempt.isSuccess) {
-            return@withContext EngineUpdateResult(
-                status = stableAttempt.getOrNull(),
-                channelUsed = "Stable"
-            )
-        }
-
-        val err = nightlyAttempt.exceptionOrNull()?.message
-            ?: stableAttempt.exceptionOrNull()?.message
-            ?: "Network or GitHub API unreachable"
-        EngineUpdateResult(
-            status = null,
-            channelUsed = "None",
-            errorMessage = err
+        // 2. Fallback: Direct binary download from GitHub releases (bypasses api.github.com 403 rate limits!)
+        val directUrls = listOf(
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
+            "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp"
         )
+
+        val binaryFile = findYtDlpBinaryFile()
+        if (binaryFile != null) {
+            var lastErr: String? = null
+            for (dlUrl in directUrls) {
+                val attempt = runCatching {
+                    val req = Request.Builder()
+                        .url(dlUrl)
+                        .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; SFIDM/3.2)")
+                        .build()
+                    webClient.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) {
+                            throw IllegalStateException("HTTP ${resp.code}")
+                        }
+                        val body = resp.body ?: throw IllegalStateException("Empty download")
+                        val tmpFile = File(binaryFile.parentFile, "yt-dlp.tmp")
+                        body.byteStream().use { input ->
+                            FileOutputStream(tmpFile).use { output ->
+                                input.copyTo(output)
+                            }
+                        }
+                        if (tmpFile.length() < 1_000_000L) {
+                            tmpFile.delete()
+                            throw IllegalStateException("Downloaded binary too small")
+                        }
+                        if (binaryFile.exists()) binaryFile.delete()
+                        if (!tmpFile.renameTo(binaryFile)) {
+                            tmpFile.copyTo(binaryFile, overwrite = true)
+                            tmpFile.delete()
+                        }
+                        binaryFile.setReadable(true, false)
+                        binaryFile.setExecutable(true, false)
+                    }
+                }
+                if (attempt.isSuccess) {
+                    val ver = runCatching { YoutubeDL.getInstance().version(context.applicationContext) }.getOrNull().orEmpty()
+                    return@withContext EngineUpdateResult(
+                        success = true,
+                        alreadyUpToDate = false,
+                        versionInfo = ver
+                    )
+                } else {
+                    lastErr = attempt.exceptionOrNull()?.message
+                }
+            }
+            return@withContext EngineUpdateResult(
+                success = false,
+                errorMessage = lastErr ?: "Could not reach github.com"
+            )
+        }
+
+        EngineUpdateResult(
+            success = false,
+            errorMessage = "yt-dlp binary path not found"
+        )
+    }
+
+    private fun findYtDlpBinaryFile(): File? {
+        val candidates = listOf(
+            File(context.noBackupFilesDir, "youtubedl-android/yt-dlp/yt-dlp"),
+            File(context.filesDir, "youtubedl-android/yt-dlp/yt-dlp"),
+            File(context.noBackupFilesDir, "youtubedl-android/packages/python/usr/bin/yt-dlp"),
+            File(context.filesDir, "youtubedl-android/packages/python/usr/bin/yt-dlp")
+        )
+        candidates.firstOrNull { it.exists() }?.let { return it }
+
+        val roots = listOfNotNull(context.noBackupFilesDir, context.filesDir)
+        for (root in roots) {
+            val found = root.walkTopDown().maxDepth(6).firstOrNull { it.isFile && it.name == "yt-dlp" }
+            if (found != null) return found
+        }
+        return null
     }
 
     fun cancelProcess(processId: String) {
@@ -107,7 +169,7 @@ class MediaVideoDownloader(
         val lower = trimmed.lowercase()
         val shortHosts = listOf(
             "pin.it", "vm.tiktok.com", "vt.tiktok.com", "fb.watch",
-            "youtu.be", "t.co", "bit.ly", "tinyurl.com", "instagr.am", "redd.it"
+            "t.co", "bit.ly", "tinyurl.com", "instagr.am", "redd.it"
         )
         if (shortHosts.none { lower.contains(it) }) {
             return normalizePinterestUrl(trimmed)
@@ -160,11 +222,11 @@ class MediaVideoDownloader(
     ): MediaOutcome = withContext(Dispatchers.IO) {
         onProgress(0f, 0L, 0L, 0L, "Resolving link...", null)
         val resolvedUrl = resolveShortUrl(url)
-        val isPinterest = resolvedUrl.contains("pinterest.", ignoreCase = true) ||
-            resolvedUrl.contains("pin.it", ignoreCase = true)
+        val lower = resolvedUrl.lowercase()
+        val isPinterest = lower.contains("pinterest.") || lower.contains("pin.it")
+        val isYouTube = lower.contains("youtube.com") || lower.contains("youtu.be")
 
         if (isPinterest) {
-            // Try yt-dlp first for video pins; if it's an Image Pin or yt-dlp fails, fall back to direct Pinterest parser
             val ytAttempt = runCatching {
                 executeYtDlp(
                     processId = processId,
@@ -173,6 +235,7 @@ class MediaVideoDownloader(
                     quality = quality,
                     isVault = isVault,
                     speedLimitBytesPerSec = speedLimitProvider(),
+                    extraExtractorArgs = null,
                     onProgress = { pct, detail, title ->
                         onProgress(pct, 0L, 0L, 0L, detail, title)
                     }
@@ -208,6 +271,48 @@ class MediaVideoDownloader(
                 ?: IllegalStateException("Could not extract video or image from Pinterest link")
         }
 
+        if (isYouTube) {
+            // Try Android/iOS native player clients first (avoids Deno/Node JS runtime errors on Android)
+            val primaryAttempt = runCatching {
+                executeYtDlp(
+                    processId = processId,
+                    targetUrl = resolvedUrl,
+                    customName = customName,
+                    quality = quality,
+                    isVault = isVault,
+                    speedLimitBytesPerSec = speedLimitProvider(),
+                    extraExtractorArgs = "youtube:player_client=android_vr,ios,android",
+                    onProgress = { pct, detail, title ->
+                        onProgress(pct, 0L, 0L, 0L, detail, title)
+                    }
+                )
+            }
+            if (primaryAttempt.isSuccess) {
+                return@withContext primaryAttempt.getOrThrow()
+            }
+
+            // Fallback client set (tv_embedded + mweb)
+            val fallbackAttempt = runCatching {
+                executeYtDlp(
+                    processId = processId,
+                    targetUrl = resolvedUrl,
+                    customName = customName,
+                    quality = quality,
+                    isVault = isVault,
+                    speedLimitBytesPerSec = speedLimitProvider(),
+                    extraExtractorArgs = "youtube:player_client=tv_embedded,mweb",
+                    onProgress = { pct, detail, title ->
+                        onProgress(pct, 0L, 0L, 0L, detail, title)
+                    }
+                )
+            }
+            if (fallbackAttempt.isSuccess) {
+                return@withContext fallbackAttempt.getOrThrow()
+            }
+
+            throw primaryAttempt.exceptionOrNull() ?: fallbackAttempt.exceptionOrNull()!!
+        }
+
         executeYtDlp(
             processId = processId,
             targetUrl = resolvedUrl,
@@ -215,6 +320,7 @@ class MediaVideoDownloader(
             quality = quality,
             isVault = isVault,
             speedLimitBytesPerSec = speedLimitProvider(),
+            extraExtractorArgs = null,
             onProgress = { pct, detail, title ->
                 onProgress(pct, 0L, 0L, 0L, detail, title)
             }
@@ -228,12 +334,14 @@ class MediaVideoDownloader(
         quality: MediaQuality,
         isVault: Boolean,
         speedLimitBytesPerSec: Long,
+        extraExtractorArgs: String?,
         onProgress: (percent: Float, detail: String, resolvedTitle: String?) -> Unit
     ): MediaOutcome = withContext(Dispatchers.IO) {
         ensureInitialized()
 
         val tempBase = File(context.cacheDir, "sfidm_media_$processId")
-        if (!tempBase.exists()) tempBase.mkdirs()
+        if (tempBase.exists()) tempBase.deleteRecursively()
+        tempBase.mkdirs()
 
         val baseName = if (customName.isNotBlank()) {
             FileExportHelper.sanitizeFileName(customName.substringBeforeLast("."))
@@ -246,12 +354,18 @@ class MediaVideoDownloader(
         request.addOption("-o", outputTemplate)
         request.addOption("--no-mtime")
         request.addOption("--no-playlist")
+        request.addOption("--no-check-certificates")
         request.addOption("--restrict-filenames")
         request.addOption("--concurrent-fragments", "4")
-        request.addOption(
-            "--user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        )
+
+        if (!extraExtractorArgs.isNullOrBlank()) {
+            request.addOption("--extractor-args", extraExtractorArgs)
+        } else {
+            request.addOption(
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            )
+        }
 
         if (speedLimitBytesPerSec > 0L) {
             val kbps = (speedLimitBytesPerSec / 1024L).coerceAtLeast(64L)
@@ -260,19 +374,19 @@ class MediaVideoDownloader(
 
         when (quality) {
             MediaQuality.BEST -> {
-                request.addOption("-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best")
+                request.addOption("-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best")
                 request.addOption("--merge-output-format", "mp4")
             }
             MediaQuality.HD_1080 -> {
-                request.addOption("-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=1080]/best")
+                request.addOption("-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best")
                 request.addOption("--merge-output-format", "mp4")
             }
             MediaQuality.HD_720 -> {
-                request.addOption("-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best")
+                request.addOption("-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best")
                 request.addOption("--merge-output-format", "mp4")
             }
             MediaQuality.SD_480 -> {
-                request.addOption("-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]/best")
+                request.addOption("-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best")
                 request.addOption("--merge-output-format", "mp4")
             }
             MediaQuality.AUDIO_MP3 -> {
@@ -359,7 +473,6 @@ class MediaVideoDownloader(
                 rawTitle?.take(55)?.ifBlank { "Pinterest_$pinId" } ?: "Pinterest_$pinId"
             }
 
-            // 1. Check for direct Pinterest MP4 video URL in HTML/JSON
             val videoMatch = Regex("https://v[0-9a-z]*\\.pinimg\\.com/videos/[^\"'\\\\\\s<>]+\\.mp4")
                 .find(html)
             if (videoMatch != null) {
@@ -368,7 +481,6 @@ class MediaVideoDownloader(
                 return PinterestMedia(directUrl = videoUrl, suggestedName = safeName, isVideo = true)
             }
 
-            // 2. Check for highest-resolution original image URL
             val origMatch = Regex("https://i\\.pinimg\\.com/originals/[^\"'\\\\\\s<>]+\\.(?:jpg|jpeg|png|webp|gif)")
                 .find(html)
             if (origMatch != null) {
@@ -378,7 +490,6 @@ class MediaVideoDownloader(
                 return PinterestMedia(directUrl = imgUrl, suggestedName = safeName, isVideo = false)
             }
 
-            // 3. Fallback to 736x / 564x image URL and try upgrading to /originals/
             val sizedMatch = Regex("https://i\\.pinimg\\.com/(?:736x|564x|474x)/[^\"'\\\\\\s<>]+\\.(?:jpg|jpeg|png|webp)")
                 .find(html)
             if (sizedMatch != null) {
@@ -390,7 +501,6 @@ class MediaVideoDownloader(
                 return PinterestMedia(directUrl = finalImgUrl, suggestedName = safeName, isVideo = false)
             }
 
-            // 4. Final fallback: og:image meta tag
             val ogImage = Regex("<meta[^>]+property=[\"']og:image[\"'][^>]+content=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
                 .find(html)?.groupValues?.getOrNull(1)
             if (!ogImage.isNullOrBlank() && ogImage.startsWith("http")) {

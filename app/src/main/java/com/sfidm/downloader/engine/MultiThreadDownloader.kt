@@ -93,7 +93,7 @@ class MultiThreadDownloader(private val context: Context) {
             val headReq = Request.Builder()
                 .url(url)
                 .head()
-                .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; SFIDM/3.1)")
+                .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; SFIDM/3.2)")
                 .build()
             client.newCall(headReq).execute().use { resp ->
                 if (resp.isSuccessful) {
@@ -113,7 +113,7 @@ class MultiThreadDownloader(private val context: Context) {
             val rangeReq = Request.Builder()
                 .url(url)
                 .header("Range", "bytes=0-0")
-                .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; SFIDM/3.1)")
+                .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; SFIDM/3.2)")
                 .build()
             client.newCall(rangeReq).execute().use { resp ->
                 val contentRange = resp.header("Content-Range")
@@ -172,7 +172,7 @@ class MultiThreadDownloader(private val context: Context) {
                     val req = Request.Builder()
                         .url(url)
                         .header("Range", "bytes=$start-$end")
-                        .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; SFIDM/3.1)")
+                        .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; SFIDM/3.2)")
                         .build()
 
                     client.newCall(req).execute().use { resp ->
@@ -217,7 +217,7 @@ class MultiThreadDownloader(private val context: Context) {
         val existingBytes = if (targetFile.exists()) targetFile.length() else 0L
         val reqBuilder = Request.Builder()
             .url(url)
-            .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; SFIDM/3.1)")
+            .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; SFIDM/3.2)")
 
         if (existingBytes > 0L && (knownTotal <= 0L || existingBytes < knownTotal)) {
             reqBuilder.header("Range", "bytes=$existingBytes-")

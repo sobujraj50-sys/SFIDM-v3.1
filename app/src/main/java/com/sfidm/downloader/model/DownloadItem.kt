@@ -34,7 +34,6 @@ enum class FileCategory(
             quality: MediaQuality = MediaQuality.BEST
         ): FileCategory {
             val lower = fileName.lowercase()
-            // Check explicit image/audio/document/archive/app extensions first
             when {
                 lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") ||
                     lower.endsWith(".webp") || lower.endsWith(".gif") || lower.endsWith(".bmp") ||
